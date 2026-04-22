@@ -1,0 +1,17 @@
+{
+  "name": "zeiterfassung-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "firebase-admin": "^13.0.1",
+    "multer": "^2.1.1",
+    "uuid": "^10.0.0"
+  }
+}
