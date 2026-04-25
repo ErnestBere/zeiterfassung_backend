@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Environment variables (Secrets!)
+.env
+.env.local
+.env.*.local
+
+# SQLite Datenbank (nur lokal, Produktion nutzt Firestore)
+*.sqlite
+*.sqlite3
+*.db
+
+# Service Account Keys (niemals committen!)
+service-account.json
+*-service-account.json
+*.key.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
