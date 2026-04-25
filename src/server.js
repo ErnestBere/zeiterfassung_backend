@@ -2,12 +2,53 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import db from './database.js';
-import { v4 as uuidv4 } from 'uuid';
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'https://zeiterfassung-frontend.pages.dev',
+  credentials: true
+}));
 app.use(express.json());
+
+// ==========================
+// CONSTANTS
+// ==========================
+
+const VALID_INVITE_CODE = process.env.INVITE_CODE || process.env.invite_code;
+if (!VALID_INVITE_CODE) {
+  console.warn('⚠️ WARNUNG: Kein INVITE_CODE gesetzt! Erstanmeldung und Seed-User sind deaktiviert.');
+}
+
+const JWT_SECRET = process.env.JWT_SECRET || 'zeiterfassung-jwt-secret-change-me';
+const JWT_EXPIRES_IN = '7d'; // Token läuft nach 7 Tagen ab
+
+// ==========================
+// AUTH MIDDLEWARE
+// ==========================
+
+const requireAuth = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Nicht authentifiziert.' });
+  }
+  try {
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; // { id, name, email, role }
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Token ungültig oder abgelaufen.' });
+  }
+};
+
+const requireGF = (req, res, next) => {
+  if (req.user?.role !== 'GF') {
+    return res.status(403).json({ error: 'Nur für Geschäftsführer.' });
+  }
+  next();
+};
 
 // ==========================
 // HEALTH & INFO
@@ -97,14 +138,19 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'E-Mail oder Passwort falsch.' });
     }
 
-    res.json({ id: employee.id, name: employee.name, email: employee.email, role: employee.role, hourly_rate: employee.hourly_rate });
+    const token = jwt.sign(
+      { id: employee.id, name: employee.name, email: employee.email, role: employee.role },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    res.json({ id: employee.id, name: employee.name, email: employee.email, role: employee.role, hourly_rate: employee.hourly_rate, token });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/auth/set-password', async (req, res) => {
   try {
     const { email, password, invite_code } = req.body;
-    const VALID_INVITE_CODE = process.env.invite_code || '85fce0c7af4544e48b97630d337f0141';
     if (invite_code?.trim() !== VALID_INVITE_CODE) return res.status(403).json({ error: 'Ungültiger Invite-Code.' });
     if (!password || password.length < 6) return res.status(400).json({ error: 'Passwort muss mindestens 6 Zeichen lang sein.' });
 
@@ -121,7 +167,12 @@ app.post('/api/auth/set-password', async (req, res) => {
     await doc.ref.update({ password_hash });
 
     const emp = doc.data();
-    res.json({ id: doc.id, name: emp.name, email: emp.email, role: emp.role, hourly_rate: emp.hourly_rate });
+    const token = jwt.sign(
+      { id: doc.id, name: emp.name, email: emp.email, role: emp.role },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+    res.json({ id: doc.id, name: emp.name, email: emp.email, role: emp.role, hourly_rate: emp.hourly_rate, token });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -142,6 +193,24 @@ app.post('/api/auth/check-email', async (req, res) => {
 });
 
 // ==========================
+// ROUTE PROTECTION
+// ==========================
+// Alle /api/ Routen schützen, AUSSER Auth-Endpoints und Email-Callback
+app.use('/api', (req, res, next) => {
+  const openPaths = [
+    '/api/auth/login',
+    '/api/auth/set-password',
+    '/api/auth/check-email',
+    '/api/email/callback',
+  ];
+  if (openPaths.includes(req.path)) return next();
+  // Admin seed-user ist durch invite_code geschützt
+  if (req.path === '/api/admin/seed-user') return next();
+  // Health & Info sind offen (kein /api/ Prefix)
+  return requireAuth(req, res, next);
+});
+
+// ==========================
 // ADMIN SEED
 // ==========================
 
@@ -149,7 +218,6 @@ app.post('/api/auth/check-email', async (req, res) => {
 app.post('/api/admin/seed-user', async (req, res) => {
   try {
     const { name, email, role, invite_code } = req.body;
-    const VALID_INVITE_CODE = process.env.invite_code || '85fce0c7af4544e48b97630d337f0141';
     if (invite_code?.trim() !== VALID_INVITE_CODE) return res.status(403).json({ error: 'Ungültiger Invite-Code.' });
     if (!name || !email) return res.status(400).json({ error: 'name und email sind erforderlich.' });
 
@@ -885,8 +953,14 @@ app.listen(PORT, async () => {
     const thomasEmail = 'thomas.kedzierski@projektwaerts.de';
     const snapshot = await db.collection('employees').where('email_lower', '==', thomasEmail).limit(1).get();
     if (snapshot.empty) {
-      const password_hash = bcrypt.hashSync('zeit-beta-2026', 10);
-      await db.collection('employees').add({ name: 'Thomas Kedzierski', email: thomasEmail, email_lower: thomasEmail, role: 'GF', hourly_rate: null, password_hash, created_date: new Date().toISOString() });
+      const seedPassword = process.env.SEED_PASSWORD;
+      if (!seedPassword) {
+        console.warn('⚠️ SEED_PASSWORD nicht gesetzt – Thomas wird ohne Passwort angelegt.');
+        await db.collection('employees').add({ name: 'Thomas Kedzierski', email: thomasEmail, email_lower: thomasEmail, role: 'GF', hourly_rate: null, created_date: new Date().toISOString() });
+      } else {
+        const password_hash = bcrypt.hashSync(seedPassword, 10);
+        await db.collection('employees').add({ name: 'Thomas Kedzierski', email: thomasEmail, email_lower: thomasEmail, role: 'GF', hourly_rate: null, password_hash, created_date: new Date().toISOString() });
+      }
       console.log('✅ Seed: Thomas Kedzierski angelegt.');
     } else {
       console.log('ℹ️ Seed: Thomas Kedzierski bereits vorhanden.');
@@ -898,8 +972,15 @@ app.listen(PORT, async () => {
     const adminEmail = 'admin@plinius-systems.de';
     const snapshot = await db.collection('employees').where('email_lower', '==', adminEmail).limit(1).get();
     if (snapshot.empty) {
-      await db.collection('employees').add({ name: 'Admin Plinius', email: adminEmail, email_lower: adminEmail, role: 'GF', hourly_rate: null, created_date: new Date().toISOString() });
-      console.log('✅ Seed: Admin Plinius angelegt (kein Passwort — Erstanmeldung erforderlich).');
+      const seedPassword = process.env.SEED_PASSWORD;
+      if (!seedPassword) {
+        console.warn('⚠️ SEED_PASSWORD nicht gesetzt – Admin Plinius wird ohne Passwort angelegt.');
+        await db.collection('employees').add({ name: 'Admin Plinius', email: adminEmail, email_lower: adminEmail, role: 'GF', hourly_rate: null, created_date: new Date().toISOString() });
+      } else {
+        const password_hash = bcrypt.hashSync(seedPassword, 10);
+        await db.collection('employees').add({ name: 'Admin Plinius', email: adminEmail, email_lower: adminEmail, role: 'GF', hourly_rate: null, password_hash, created_date: new Date().toISOString() });
+      }
+      console.log('✅ Seed: Admin Plinius angelegt.');
     } else {
       console.log('ℹ️ Seed: Admin Plinius bereits vorhanden.');
     }
