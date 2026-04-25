@@ -693,6 +693,105 @@ app.post('/api/email/send-timesheet', async (req, res) => {
 });
 
 // ==========================
+// BACKUP (nur für GF)
+// ==========================
+
+app.get('/api/admin/backup/status', async (req, res) => {
+  try {
+    // Backup-Status aus Firestore laden
+    const doc = await db.collection('app_settings').doc('last_backup').get();
+    
+    if (!doc.exists) {
+      return res.json({ 
+        status: 'never',
+        message: 'Noch kein Backup erstellt'
+      });
+    }
+    
+    res.json(doc.data());
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+app.get('/api/admin/backup', async (req, res) => {
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    
+    // Alle Collections exportieren
+    const collections = ['employees', 'projects', 'subprojects', 'activities', 
+                        'timesheets', 'project_billings', 'app_settings'];
+    
+    const backup = {
+      created_at: new Date().toISOString(),
+      version: '1.0',
+      collections: {}
+    };
+    
+    let totalDocs = 0;
+    for (const collectionName of collections) {
+      const snapshot = await db.collection(collectionName).get();
+      backup.collections[collectionName] = snapshot.docs.map(doc => ({ 
+        id: doc.id, 
+        ...doc.data() 
+      }));
+      totalDocs += snapshot.size;
+    }
+    
+    // Backup-Status speichern
+    await db.collection('app_settings').doc('last_backup').set({
+      timestamp: new Date().toISOString(),
+      status: 'success',
+      type: 'manual',
+      total_documents: totalDocs,
+      collections: collections.length
+    }, { merge: true });
+    
+    // Als JSON zurückgeben
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="zeiterfassung_backup_${timestamp}.json"`);
+    res.json(backup);
+    
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+app.get('/api/admin/backup/csv', async (req, res) => {
+  try {
+    const { collection } = req.query;
+    if (!collection) return res.status(400).json({ error: 'collection parameter required' });
+    
+    const snapshot = await db.collection(collection).get();
+    const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    if (docs.length === 0) {
+      return res.status(404).json({ error: 'No documents found' });
+    }
+    
+    // CSV generieren
+    const keys = Object.keys(docs[0]);
+    const csv = [
+      keys.join(','),
+      ...docs.map(doc => keys.map(key => {
+        const value = doc[key];
+        if (value === null || value === undefined) return '';
+        if (typeof value === 'object') return `"${JSON.stringify(value).replace(/"/g, '""')}"`;
+        return `"${String(value).replace(/"/g, '""')}"`;
+      }).join(','))
+    ].join('\n');
+    
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${collection}_${timestamp}.csv"`);
+    res.send('\uFEFF' + csv); // UTF-8 BOM für Excel
+    
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+// ==========================
 // START
 // ==========================
 
