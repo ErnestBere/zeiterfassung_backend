@@ -576,26 +576,54 @@ function replacePlaceholders(text, data) {
   // Extrahiere Vor- und Nachname aus project_leader
   let firstName = '';
   let lastName = '';
+  let isMultipleLeaders = false;
+  
   if (data.project_leader) {
-    const parts = data.project_leader.trim().split(' ');
-    if (parts.length > 1) {
-      firstName = parts[0];
-      lastName = parts.slice(1).join(' ');
+    // Prüfe ob mehrere Projektleiter (durch Komma getrennt)
+    const leaders = data.project_leader.split(',').map(l => l.trim()).filter(Boolean);
+    isMultipleLeaders = leaders.length > 1;
+    
+    if (isMultipleLeaders) {
+      // Bei mehreren PLs: Neutrale Anrede
+      firstName = '';
+      lastName = '';
     } else {
-      lastName = parts[0];
+      // Bei einem PL: Extrahiere Vor- und Nachname
+      const parts = leaders[0].trim().split(' ');
+      if (parts.length > 1) {
+        firstName = parts[0];
+        lastName = parts.slice(1).join(' ');
+      } else {
+        lastName = parts[0];
+      }
     }
   }
   
-  return text
+  // Ersetze Platzhalter
+  let result = text
     .replace(/{month}/g, data.month || '')
     .replace(/{project_number}/g, data.project_number || '')
     .replace(/{project_name}/g, data.project_name || '')
-    .replace(/{project_leader_lastname}/g, lastName)
-    .replace(/{project_leader_firstname}/g, firstName)
     .replace(/{project_leader}/g, data.project_leader || '')
     .replace(/{employee_name}/g, data.employee_name || '')
     .replace(/{total_hours}/g, data.total_hours || '')
     .replace(/{sender_name}/g, data.sender_name || '');
+  
+  // Spezielle Behandlung für Anrede bei mehreren PLs
+  if (isMultipleLeaders) {
+    // Ersetze personalisierte Anrede durch neutrale
+    result = result
+      .replace(/Sehr geehrte(?:r)? (?:Frau|Herr) \{project_leader_lastname\}/gi, 'Sehr geehrte Damen und Herren')
+      .replace(/\{project_leader_firstname\}/g, '')
+      .replace(/\{project_leader_lastname\}/g, '');
+  } else {
+    // Normale Ersetzung für einen PL
+    result = result
+      .replace(/{project_leader_firstname}/g, firstName)
+      .replace(/{project_leader_lastname}/g, lastName);
+  }
+  
+  return result;
 }
 
 async function refreshAccessToken(refreshToken) {
