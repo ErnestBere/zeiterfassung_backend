@@ -685,14 +685,23 @@ app.post('/api/email/send-timesheet', async (req, res) => {
       message.attachments = [{ '@odata.type': '#microsoft.graph.fileAttachment', name: pdf_filename, contentType: 'application/pdf', contentBytes: pdf_base64 }];
     }
 
-    const graphResponse = await fetch('https://graph.microsoft.com/v1.0/me/sendMail', {
+    // E-Mail als ENTWURF speichern (nicht direkt senden!)
+    // Erstelle Entwurf im Drafts-Ordner
+    const graphResponse = await fetch('https://graph.microsoft.com/v1.0/me/messages', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, saveToSentItems: true }),
+      body: JSON.stringify(message),
     });
 
     if (!graphResponse.ok) return res.status(502).json({ error: `Graph API Fehler: ${graphResponse.status} ${await graphResponse.text()}` });
-    res.json({ success: true, sentFrom: tokens.sender_email });
+    
+    const draft = await graphResponse.json();
+    res.json({ 
+      success: true, 
+      draftId: draft.id,
+      message: 'E-Mail wurde als Entwurf gespeichert. Bitte in Outlook prüfen und manuell senden.',
+      sentFrom: tokens.sender_email 
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
