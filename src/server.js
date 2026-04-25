@@ -10,6 +10,51 @@ app.use(cors());
 app.use(express.json());
 
 // ==========================
+// HEALTH & INFO
+// ==========================
+
+app.get('/health', async (req, res) => {
+  try {
+    const employeesRef = db.collection('employees');
+    const snapshot = await employeesRef.limit(1).get();
+    
+    res.json({ 
+      status: 'healthy', 
+      database: 'firestore',
+      connected: true,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'unhealthy', 
+      database: 'firestore',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'Zeiterfassung Backend API (Firestore)',
+    version: '2.0.0',
+    database: 'firestore',
+    endpoints: [
+      'GET /health',
+      'GET /',
+      'POST /api/auth/login',
+      'POST /api/auth/set-password',
+      'POST /api/auth/check-email',
+      'POST /api/admin/seed-user',
+      'GET /api/employees',
+      'POST /api/employees',
+      'GET /api/projects',
+      'GET /api/activities'
+    ]
+  });
+});
+
+// ==========================
 // HELPERS
 // ==========================
 
