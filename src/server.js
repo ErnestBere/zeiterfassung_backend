@@ -530,7 +530,7 @@ app.get('/api/email/templates', async (req, res) => {
     if (!doc.exists) {
       return res.json({ 
         subject: "Stundenzettel {month} - {project_number} {project_name}",
-        body: `Sehr geehrte Damen und Herren,\n\nanbei erhalten Sie den Stundenzettel für {month}.\n\nProjekt: {project_number} - {project_name}\nMitarbeiter: {employee_name}\nGesamtstunden: {total_hours}\n\nMit freundlichen Grüßen\n{sender_name}`
+        body: `Sehr geehrte Frau/Herr {project_leader_lastname},\n\nanbei erhalten Sie den Stundenzettel für {month}.\n\nProjekt: {project_number} - {project_name}\nProjektleiter: {project_leader}\nMitarbeiter: {employee_name}\nGesamtstunden: {total_hours}\n\nMit freundlichen Grüßen\n{sender_name}`
       });
     }
     res.json(doc.data());
