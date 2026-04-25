@@ -232,8 +232,31 @@ app.post('/api/projects', async (req, res) => {
     const error = validateRequired(data, ['project_number', 'project_name']);
     if (error) return res.status(400).json({ error });
     const created_date = new Date().toISOString();
-    const docRef = await db.collection('projects').add({ payment_terms: 30, vat_rate: 19, ...data, created_date });
-    res.json({ id: docRef.id, ...data, created_date });
+    
+    // Extrahiere initial_subprojects falls vorhanden
+    const { initial_subprojects, ...projectData } = data;
+    
+    const docRef = await db.collection('projects').add({ payment_terms: 30, vat_rate: 19, ...projectData, created_date });
+    const projectId = docRef.id;
+    
+    // Erstelle Subprojekte falls vorhanden
+    if (initial_subprojects && Array.isArray(initial_subprojects) && initial_subprojects.length > 0) {
+      const batch = db.batch();
+      initial_subprojects.forEach(sub => {
+        if (sub.name && sub.name.trim()) {
+          const subRef = db.collection('subprojects').doc();
+          batch.set(subRef, {
+            project_id: projectId,
+            name: sub.name.trim(),
+            number: sub.number?.trim() || null,
+            created_date
+          });
+        }
+      });
+      await batch.commit();
+    }
+    
+    res.json({ id: projectId, ...projectData, created_date });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -495,6 +518,42 @@ app.post('/api/project-billings', async (req, res) => {
       res.json({ id: docRef.id, ...req.body });
     }
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==========================
+// EMAIL TEMPLATES
+// ==========================
+
+app.get('/api/email/templates', async (req, res) => {
+  try {
+    const doc = await db.collection('app_settings').doc('email_templates').get();
+    if (!doc.exists) {
+      return res.json({ 
+        subject: "Stundenzettel {month} - {project_number} {project_name}",
+        body: `Sehr geehrte Damen und Herren,\n\nanbei erhalten Sie den Stundenzettel für {month}.\n\nProjekt: {project_number} - {project_name}\nMitarbeiter: {employee_name}\nGesamtstunden: {total_hours}\n\nMit freundlichen Grüßen\n{sender_name}`
+      });
+    }
+    res.json(doc.data());
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+app.post('/api/email/templates', async (req, res) => {
+  try {
+    const { subject, body } = req.body;
+    if (!subject || !body) return res.status(400).json({ error: 'subject und body sind erforderlich.' });
+    
+    await db.collection('app_settings').doc('email_templates').set({ 
+      subject, 
+      body, 
+      updated_at: new Date().toISOString() 
+    }, { merge: true });
+    
+    res.json({ success: true, subject, body });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // ==========================
