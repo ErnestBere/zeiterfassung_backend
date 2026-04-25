@@ -636,9 +636,13 @@ app.get('/api/email/callback', async (req, res) => {
     }
 
     await storeTokens({ access_token: tokens.access_token, refresh_token: tokens.refresh_token, expires_at: new Date(Date.now() + tokens.expires_in * 1000).toISOString(), sender_email: senderEmail });
-    res.redirect(`/?ms_auth=success&email=${encodeURIComponent(senderEmail || '')}`);
+    
+    // Redirect zur Frontend-URL (nicht Backend!)
+    const frontendUrl = process.env.FRONTEND_URL || 'https://zeiterfassung-frontend.pages.dev';
+    res.redirect(`${frontendUrl}/settings?ms_auth=success&email=${encodeURIComponent(senderEmail || '')}`);
   } catch (err) {
-    res.redirect(`/?ms_auth=error&message=${encodeURIComponent(err.message)}`);
+    const frontendUrl = process.env.FRONTEND_URL || 'https://zeiterfassung-frontend.pages.dev';
+    res.redirect(`${frontendUrl}/settings?ms_auth=error&message=${encodeURIComponent(err.message)}`);
   }
 });
 
