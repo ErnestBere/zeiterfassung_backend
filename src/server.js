@@ -313,10 +313,53 @@ app.post('/api/activities', async (req, res) => {
     const data = req.body;
     const error = validateRequired(data, ['project_id', 'description', 'activity_date', 'actual_hours']);
     if (error) return res.status(400).json({ error });
+    
     const created_date = new Date().toISOString();
-    const docRef = await db.collection('activities').add({ status: 'offen', ...data, created_date });
-    res.json({ id: docRef.id, ...data, created_date });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    
+    // Wenn employee_name mehrere Mitarbeiter enthält (durch Komma getrennt),
+    // erstelle für jeden eine separate Tätigkeit
+    const employeeNames = data.employee_name 
+      ? data.employee_name.split(',').map(name => name.trim()).filter(Boolean)
+      : [null];
+    
+    if (employeeNames.length === 1) {
+      // Einzelner Mitarbeiter oder kein Mitarbeiter
+      const docRef = await db.collection('activities').add({ 
+        status: 'offen', 
+        ...data, 
+        employee_name: employeeNames[0],
+        created_date 
+      });
+      return res.json({ id: docRef.id, ...data, employee_name: employeeNames[0], created_date });
+    }
+    
+    // Mehrere Mitarbeiter: Erstelle separate Tätigkeiten
+    const batch = db.batch();
+    const createdActivities = [];
+    
+    for (const employeeName of employeeNames) {
+      const activityData = {
+        ...data,
+        employee_name: employeeName,
+        status: 'offen',
+        created_date
+      };
+      const docRef = db.collection('activities').doc(); // Neue ID generieren
+      batch.set(docRef, activityData);
+      createdActivities.push({ id: docRef.id, ...activityData });
+    }
+    
+    await batch.commit();
+    
+    // Gebe alle erstellten Tätigkeiten zurück
+    res.json({ 
+      success: true, 
+      count: createdActivities.length,
+      activities: createdActivities 
+    });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 app.put('/api/activities/:id', async (req, res) => {
