@@ -570,6 +570,34 @@ async function storeTokens(tokens) {
   await db.collection('app_settings').doc('ms_oauth').set({ ...tokens, updated_at: new Date().toISOString() }, { merge: true });
 }
 
+function replacePlaceholders(text, data) {
+  if (!text) return text;
+  
+  // Extrahiere Vor- und Nachname aus project_leader
+  let firstName = '';
+  let lastName = '';
+  if (data.project_leader) {
+    const parts = data.project_leader.trim().split(' ');
+    if (parts.length > 1) {
+      firstName = parts[0];
+      lastName = parts.slice(1).join(' ');
+    } else {
+      lastName = parts[0];
+    }
+  }
+  
+  return text
+    .replace(/{month}/g, data.month || '')
+    .replace(/{project_number}/g, data.project_number || '')
+    .replace(/{project_name}/g, data.project_name || '')
+    .replace(/{project_leader_lastname}/g, lastName)
+    .replace(/{project_leader_firstname}/g, firstName)
+    .replace(/{project_leader}/g, data.project_leader || '')
+    .replace(/{employee_name}/g, data.employee_name || '')
+    .replace(/{total_hours}/g, data.total_hours || '')
+    .replace(/{sender_name}/g, data.sender_name || '');
+}
+
 async function refreshAccessToken(refreshToken) {
   const params = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -661,7 +689,7 @@ app.delete('/api/email/disconnect', async (req, res) => {
 });
 
 app.post('/api/email/send-timesheet', async (req, res) => {
-  const { to, cc, subject, body, pdf_base64, pdf_filename } = req.body;
+  const { to, cc, subject, body, pdf_base64, pdf_filename, project_data } = req.body;
   if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject und body sind erforderlich.' });
 
   try {
@@ -677,10 +705,22 @@ app.post('/api/email/send-timesheet', async (req, res) => {
       await storeTokens(tokens);
     }
 
+    // Platzhalter ersetzen (falls project_data vorhanden)
+    let finalSubject = subject;
+    let finalBody = body;
+    if (project_data) {
+      const placeholderData = {
+        ...project_data,
+        sender_name: tokens.sender_email?.split('@')[0] || ''
+      };
+      finalSubject = replacePlaceholders(subject, placeholderData);
+      finalBody = replacePlaceholders(body, placeholderData);
+    }
+
     const toList = (Array.isArray(to) ? to : [to]).map(email => ({ emailAddress: { address: email } }));
     const ccList = cc ? (Array.isArray(cc) ? cc : [cc]).map(email => ({ emailAddress: { address: email } })) : [];
 
-    const message = { subject, body: { contentType: 'Text', content: body }, toRecipients: toList, ccRecipients: ccList };
+    const message = { subject: finalSubject, body: { contentType: 'Text', content: finalBody }, toRecipients: toList, ccRecipients: ccList };
     if (pdf_base64 && pdf_filename) {
       message.attachments = [{ '@odata.type': '#microsoft.graph.fileAttachment', name: pdf_filename, contentType: 'application/pdf', contentBytes: pdf_base64 }];
     }
