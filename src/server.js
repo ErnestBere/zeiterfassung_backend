@@ -356,8 +356,11 @@ app.get('/api/subprojects', async (req, res) => {
     const { project_id } = req.query;
     let query = db.collection('subprojects');
     if (project_id) query = query.where('project_id', '==', project_id);
-    const snapshot = await query.orderBy('name').get();
-    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    const snapshot = await query.get();
+    const results = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    // Sortierung im Code statt Firestore (vermeidet Composite Index)
+    results.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    res.json(results);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -700,7 +703,7 @@ async function refreshAccessToken(refreshToken) {
     client_id: process.env.M365_CLIENT_ID,
     client_secret: process.env.M365_CLIENT_SECRET,
     refresh_token: refreshToken,
-    scope: 'https://graph.microsoft.com/Mail.Send offline_access',
+    scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite offline_access',
   });
 
   const response = await fetch(`https://login.microsoftonline.com/${process.env.M365_TENANT_ID}/oauth2/v2.0/token`, {
@@ -719,7 +722,7 @@ app.get('/api/email/auth-url', (req, res) => {
     client_id: process.env.M365_CLIENT_ID,
     response_type: 'code',
     redirect_uri: redirectUri,
-    scope: 'https://graph.microsoft.com/Mail.Send offline_access',
+    scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite offline_access',
     response_mode: 'query',
     prompt: 'select_account',
   });
@@ -739,7 +742,7 @@ app.get('/api/email/callback', async (req, res) => {
       client_secret: process.env.M365_CLIENT_SECRET,
       code,
       redirect_uri: redirectUri,
-      scope: 'https://graph.microsoft.com/Mail.Send offline_access',
+      scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite offline_access',
     });
 
     const tokenResponse = await fetch(`https://login.microsoftonline.com/${process.env.M365_TENANT_ID}/oauth2/v2.0/token`, {
@@ -936,6 +939,117 @@ app.get('/api/admin/backup/csv', async (req, res) => {
     res.send('\uFEFF' + csv); // UTF-8 BOM für Excel
     
   } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+// ==========================
+// ONEDRIVE BACKUP
+// ==========================
+
+// OneDrive-Pfad speichern/laden
+app.get('/api/admin/onedrive-config', async (req, res) => {
+  try {
+    const doc = await db.collection('app_settings').doc('onedrive_backup').get();
+    res.json(doc.exists ? doc.data() : { folder_path: '/Zeiterfassung/Backups' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/onedrive-config', async (req, res) => {
+  try {
+    const { folder_path } = req.body;
+    if (!folder_path) return res.status(400).json({ error: 'folder_path ist erforderlich.' });
+    await db.collection('app_settings').doc('onedrive_backup').set({ 
+      folder_path, 
+      updated_at: new Date().toISOString() 
+    }, { merge: true });
+    res.json({ success: true, folder_path });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Backup nach OneDrive hochladen
+app.post('/api/admin/backup/onedrive', async (req, res) => {
+  try {
+    // 1. Tokens laden
+    let tokens = await getStoredTokens();
+    if (!tokens?.refresh_token) {
+      return res.status(401).json({ error: 'Microsoft-Konto nicht verbunden. Bitte zuerst in Einstellungen verbinden.' });
+    }
+
+    // Token refreshen falls nötig
+    const isExpired = !tokens.expires_at || new Date(tokens.expires_at) <= new Date(Date.now() + 60000);
+    if (isExpired || !tokens.access_token) {
+      const refreshed = await refreshAccessToken(tokens.refresh_token);
+      tokens.access_token = refreshed.access_token;
+      tokens.expires_at = new Date(Date.now() + refreshed.expires_in * 1000).toISOString();
+      if (refreshed.refresh_token) tokens.refresh_token = refreshed.refresh_token;
+      await storeTokens(tokens);
+    }
+
+    // 2. OneDrive-Pfad laden
+    const configDoc = await db.collection('app_settings').doc('onedrive_backup').get();
+    const folderPath = configDoc.exists ? configDoc.data().folder_path : '/Zeiterfassung/Backups';
+
+    // 3. Backup-Daten erstellen
+    const collections = ['employees', 'projects', 'subprojects', 'activities', 'timesheets', 'project_billings', 'app_settings'];
+    const backup = { created_at: new Date().toISOString(), version: '1.0', collections: {} };
+    let totalDocs = 0;
+
+    for (const collectionName of collections) {
+      const snapshot = await db.collection(collectionName).get();
+      backup.collections[collectionName] = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      totalDocs += snapshot.size;
+    }
+
+    // 4. Nach OneDrive hochladen
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const fileName = `zeiterfassung_backup_${timestamp}.json`;
+    // Pfad normalisieren: führende/trailing Slashes entfernen
+    const cleanPath = folderPath.replace(/^\/+|\/+$/g, '');
+    const uploadPath = `/me/drive/root:/${cleanPath}/${fileName}:/content`;
+
+    const uploadResponse = await fetch(`https://graph.microsoft.com/v1.0${uploadPath}`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${tokens.access_token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(backup),
+    });
+
+    if (!uploadResponse.ok) {
+      const errText = await uploadResponse.text();
+      throw new Error(`OneDrive Upload fehlgeschlagen: ${uploadResponse.status} ${errText}`);
+    }
+
+    const uploadResult = await uploadResponse.json();
+
+    // 5. Backup-Status speichern
+    await db.collection('app_settings').doc('last_backup').set({
+      timestamp: new Date().toISOString(),
+      status: 'success',
+      type: 'onedrive',
+      total_documents: totalDocs,
+      collections: collections.length,
+      onedrive_path: `${cleanPath}/${fileName}`,
+      onedrive_url: uploadResult.webUrl || null,
+    }, { merge: true });
+
+    res.json({ 
+      success: true, 
+      fileName,
+      path: `${cleanPath}/${fileName}`,
+      webUrl: uploadResult.webUrl || null,
+      totalDocuments: totalDocs,
+    });
+  } catch (err) { 
+    // Fehler-Status speichern
+    await db.collection('app_settings').doc('last_backup').set({
+      timestamp: new Date().toISOString(),
+      status: 'failed',
+      type: 'onedrive',
+      error: err.message,
+    }, { merge: true }).catch(() => {});
     res.status(500).json({ error: err.message }); 
   }
 });
