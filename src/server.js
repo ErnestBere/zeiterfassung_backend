@@ -565,4 +565,16 @@ app.listen(PORT, async () => {
       console.log('ℹ️ Seed: Thomas Kedzierski bereits vorhanden.');
     }
   } catch (err) { console.error('❌ Seed Fehler:', err.message); }
+
+  // Seed: Admin Plinius (GF) anlegen falls er fehlt
+  try {
+    const adminEmail = 'admin@plinius-systems.de';
+    const snapshot = await db.collection('employees').where('email_lower', '==', adminEmail).limit(1).get();
+    if (snapshot.empty) {
+      await db.collection('employees').add({ name: 'Admin Plinius', email: adminEmail, email_lower: adminEmail, role: 'GF', hourly_rate: null, created_date: new Date().toISOString() });
+      console.log('✅ Seed: Admin Plinius angelegt (kein Passwort — Erstanmeldung erforderlich).');
+    } else {
+      console.log('ℹ️ Seed: Admin Plinius bereits vorhanden.');
+    }
+  } catch (err) { console.error('❌ Seed Fehler:', err.message); }
 });
