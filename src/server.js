@@ -203,6 +203,7 @@ app.use('/api', (req, res, next) => {
     '/auth/check-email',
     '/email/callback',
     '/admin/seed-user',
+    '/cron/backup-onedrive',
   ];
   if (openPaths.includes(req.path)) return next();
   return requireAuth(req, res, next);
@@ -965,6 +966,65 @@ app.post('/api/admin/onedrive-config', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Backup wiederherstellen (Restore)
+app.post('/api/admin/backup/restore', async (req, res) => {
+  try {
+    const backupData = req.body;
+    if (!backupData?.collections) {
+      return res.status(400).json({ error: 'Ungültiges Backup-Format. "collections" fehlt.' });
+    }
+
+    const allowedCollections = ['employees', 'projects', 'subprojects', 'activities', 'timesheets', 'project_billings'];
+    let totalRestored = 0;
+    const results = {};
+
+    for (const collectionName of allowedCollections) {
+      const docs = backupData.collections[collectionName];
+      if (!docs || !Array.isArray(docs) || docs.length === 0) {
+        results[collectionName] = 0;
+        continue;
+      }
+
+      // Bestehende Dokumente löschen
+      const existing = await db.collection(collectionName).get();
+      const deleteBatch = db.batch();
+      existing.docs.forEach(doc => deleteBatch.delete(doc.ref));
+      if (existing.size > 0) await deleteBatch.commit();
+
+      // Neue Dokumente einfügen (in Batches von max 500)
+      let count = 0;
+      for (let i = 0; i < docs.length; i += 450) {
+        const chunk = docs.slice(i, i + 450);
+        const batch = db.batch();
+        for (const doc of chunk) {
+          const { id, ...data } = doc;
+          const ref = id ? db.collection(collectionName).doc(id) : db.collection(collectionName).doc();
+          batch.set(ref, data);
+          count++;
+        }
+        await batch.commit();
+      }
+
+      results[collectionName] = count;
+      totalRestored += count;
+    }
+
+    // app_settings separat (merge statt replace)
+    if (backupData.collections.app_settings) {
+      for (const doc of backupData.collections.app_settings) {
+        const { id, ...data } = doc;
+        if (id) await db.collection('app_settings').doc(id).set(data, { merge: true });
+      }
+      results['app_settings'] = backupData.collections.app_settings.length;
+      totalRestored += backupData.collections.app_settings.length;
+    }
+
+    res.json({ success: true, totalRestored, results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Backup nach OneDrive hochladen
 app.post('/api/admin/backup/onedrive', async (req, res) => {
   try {
@@ -987,6 +1047,9 @@ app.post('/api/admin/backup/onedrive', async (req, res) => {
     // 2. OneDrive-Pfad laden
     const configDoc = await db.collection('app_settings').doc('onedrive_backup').get();
     const folderPath = configDoc.exists ? configDoc.data().folder_path : '/Zeiterfassung/Backups';
+    const cleanPath = folderPath.replace(/^\/+|\/+$/g, '');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const backupFolder = `${cleanPath}/${timestamp}`;
 
     // 3. Backup-Daten erstellen
     const collections = ['employees', 'projects', 'subprojects', 'activities', 'timesheets', 'project_billings', 'app_settings'];
@@ -999,45 +1062,72 @@ app.post('/api/admin/backup/onedrive', async (req, res) => {
       totalDocs += snapshot.size;
     }
 
-    // 4. Nach OneDrive hochladen
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
-    const fileName = `zeiterfassung_backup_${timestamp}.json`;
-    // Pfad normalisieren: führende/trailing Slashes entfernen
-    const cleanPath = folderPath.replace(/^\/+|\/+$/g, '');
-    const uploadPath = `/me/drive/root:/${cleanPath}/${fileName}:/content`;
+    // Helper: Upload nach OneDrive
+    const uploadToOneDrive = async (fileName, content, contentType) => {
+      const uploadPath = `/me/drive/root:/${backupFolder}/${fileName}:/content`;
+      const response = await fetch(`https://graph.microsoft.com/v1.0${uploadPath}`, {
+        method: 'PUT',
+        headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Content-Type': contentType },
+        body: content,
+      });
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Upload ${fileName} fehlgeschlagen: ${response.status} ${errText}`);
+      }
+      return response.json();
+    };
 
-    const uploadResponse = await fetch(`https://graph.microsoft.com/v1.0${uploadPath}`, {
-      method: 'PUT',
-      headers: {
-        'Authorization': `Bearer ${tokens.access_token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(backup),
-    });
+    // Helper: Collection zu CSV
+    const toCSV = (docs) => {
+      if (!docs || docs.length === 0) return null;
+      const keys = Object.keys(docs[0]);
+      const rows = [
+        keys.join(','),
+        ...docs.map(doc => keys.map(key => {
+          const value = doc[key];
+          if (value === null || value === undefined) return '';
+          if (typeof value === 'object') return `"${JSON.stringify(value).replace(/"/g, '""')}"`;
+          return `"${String(value).replace(/"/g, '""')}"`;
+        }).join(','))
+      ];
+      return '\uFEFF' + rows.join('\n'); // UTF-8 BOM für Excel
+    };
 
-    if (!uploadResponse.ok) {
-      const errText = await uploadResponse.text();
-      throw new Error(`OneDrive Upload fehlgeschlagen: ${uploadResponse.status} ${errText}`);
+    // 4. JSON-Backup hochladen
+    const jsonFileName = `zeiterfassung_backup.json`;
+    const jsonResult = await uploadToOneDrive(jsonFileName, JSON.stringify(backup), 'application/json');
+
+    // 5. CSV-Dateien hochladen (pro Collection)
+    const csvCollections = ['employees', 'projects', 'subprojects', 'activities', 'timesheets', 'project_billings'];
+    const uploadedFiles = [jsonFileName];
+
+    for (const collName of csvCollections) {
+      const docs = backup.collections[collName];
+      const csv = toCSV(docs);
+      if (csv) {
+        const csvFileName = `${collName}.csv`;
+        await uploadToOneDrive(csvFileName, csv, 'text/csv; charset=utf-8');
+        uploadedFiles.push(csvFileName);
+      }
     }
 
-    const uploadResult = await uploadResponse.json();
-
-    // 5. Backup-Status speichern
+    // 6. Backup-Status speichern
     await db.collection('app_settings').doc('last_backup').set({
       timestamp: new Date().toISOString(),
       status: 'success',
       type: 'onedrive',
       total_documents: totalDocs,
       collections: collections.length,
-      onedrive_path: `${cleanPath}/${fileName}`,
-      onedrive_url: uploadResult.webUrl || null,
+      onedrive_path: backupFolder,
+      onedrive_url: jsonResult.webUrl || null,
+      files_uploaded: uploadedFiles.length,
     }, { merge: true });
 
     res.json({ 
       success: true, 
-      fileName,
-      path: `${cleanPath}/${fileName}`,
-      webUrl: uploadResult.webUrl || null,
+      files: uploadedFiles,
+      path: backupFolder,
+      webUrl: jsonResult.webUrl || null,
       totalDocuments: totalDocs,
     });
   } catch (err) { 
@@ -1049,6 +1139,114 @@ app.post('/api/admin/backup/onedrive', async (req, res) => {
       error: err.message,
     }, { merge: true }).catch(() => {});
     res.status(500).json({ error: err.message }); 
+  }
+});
+
+// ==========================
+// CRON: Tägliches OneDrive Backup (aufgerufen von Cloud Scheduler)
+// ==========================
+
+app.post('/api/cron/backup-onedrive', async (req, res) => {
+  // Schutz: Nur Cloud Scheduler oder mit CRON_SECRET
+  const cronSecret = process.env.CRON_SECRET;
+  const authHeader = req.headers['x-cron-secret'] || req.headers.authorization?.replace('Bearer ', '');
+  
+  if (cronSecret && authHeader !== cronSecret) {
+    return res.status(403).json({ error: 'Nicht autorisiert.' });
+  }
+
+  try {
+    // Tokens laden
+    let tokens = await getStoredTokens();
+    if (!tokens?.refresh_token) {
+      return res.status(400).json({ error: 'Microsoft-Konto nicht verbunden. Cron-Backup übersprungen.' });
+    }
+
+    // Token refreshen
+    const isExpired = !tokens.expires_at || new Date(tokens.expires_at) <= new Date(Date.now() + 60000);
+    if (isExpired || !tokens.access_token) {
+      const refreshed = await refreshAccessToken(tokens.refresh_token);
+      tokens.access_token = refreshed.access_token;
+      tokens.expires_at = new Date(Date.now() + refreshed.expires_in * 1000).toISOString();
+      if (refreshed.refresh_token) tokens.refresh_token = refreshed.refresh_token;
+      await storeTokens(tokens);
+    }
+
+    // OneDrive-Pfad laden
+    const configDoc = await db.collection('app_settings').doc('onedrive_backup').get();
+    const folderPath = configDoc.exists ? configDoc.data().folder_path : '/Zeiterfassung/Backups';
+    const cleanPath = folderPath.replace(/^\/+|\/+$/g, '');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const backupFolder = `${cleanPath}/${timestamp}`;
+
+    // Backup-Daten erstellen
+    const collections = ['employees', 'projects', 'subprojects', 'activities', 'timesheets', 'project_billings', 'app_settings'];
+    const backup = { created_at: new Date().toISOString(), version: '1.0', collections: {} };
+    let totalDocs = 0;
+
+    for (const collectionName of collections) {
+      const snapshot = await db.collection(collectionName).get();
+      backup.collections[collectionName] = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      totalDocs += snapshot.size;
+    }
+
+    // Helper: Upload
+    const uploadToOneDrive = async (fileName, content, contentType) => {
+      const uploadPath = `/me/drive/root:/${backupFolder}/${fileName}:/content`;
+      const response = await fetch(`https://graph.microsoft.com/v1.0${uploadPath}`, {
+        method: 'PUT',
+        headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Content-Type': contentType },
+        body: content,
+      });
+      if (!response.ok) throw new Error(`Upload ${fileName}: ${response.status}`);
+      return response.json();
+    };
+
+    // Helper: CSV
+    const toCSV = (docs) => {
+      if (!docs || docs.length === 0) return null;
+      const keys = Object.keys(docs[0]);
+      return '\uFEFF' + [
+        keys.join(','),
+        ...docs.map(doc => keys.map(key => {
+          const v = doc[key];
+          if (v == null) return '';
+          if (typeof v === 'object') return `"${JSON.stringify(v).replace(/"/g, '""')}"`;
+          return `"${String(v).replace(/"/g, '""')}"`;
+        }).join(','))
+      ].join('\n');
+    };
+
+    // JSON hochladen
+    await uploadToOneDrive('zeiterfassung_backup.json', JSON.stringify(backup), 'application/json');
+
+    // CSVs hochladen
+    const csvCollections = ['employees', 'projects', 'subprojects', 'activities', 'timesheets', 'project_billings'];
+    for (const c of csvCollections) {
+      const csv = toCSV(backup.collections[c]);
+      if (csv) await uploadToOneDrive(`${c}.csv`, csv, 'text/csv; charset=utf-8');
+    }
+
+    // Status speichern
+    await db.collection('app_settings').doc('last_backup').set({
+      timestamp: new Date().toISOString(),
+      status: 'success',
+      type: 'cron-onedrive',
+      total_documents: totalDocs,
+      onedrive_path: backupFolder,
+    }, { merge: true });
+
+    console.log(`✅ Cron-Backup: ${totalDocs} Dokumente nach OneDrive/${cleanPath} gesichert.`);
+    res.json({ success: true, totalDocuments: totalDocs });
+  } catch (err) {
+    console.error('❌ Cron-Backup Fehler:', err.message);
+    await db.collection('app_settings').doc('last_backup').set({
+      timestamp: new Date().toISOString(),
+      status: 'failed',
+      type: 'cron-onedrive',
+      error: err.message,
+    }, { merge: true }).catch(() => {});
+    res.status(500).json({ error: err.message });
   }
 });
 
