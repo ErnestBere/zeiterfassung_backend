@@ -198,15 +198,13 @@ app.post('/api/auth/check-email', async (req, res) => {
 // Alle /api/ Routen schützen, AUSSER Auth-Endpoints und Email-Callback
 app.use('/api', (req, res, next) => {
   const openPaths = [
-    '/api/auth/login',
-    '/api/auth/set-password',
-    '/api/auth/check-email',
-    '/api/email/callback',
+    '/auth/login',
+    '/auth/set-password',
+    '/auth/check-email',
+    '/email/callback',
+    '/admin/seed-user',
   ];
   if (openPaths.includes(req.path)) return next();
-  // Admin seed-user ist durch invite_code geschützt
-  if (req.path === '/api/admin/seed-user') return next();
-  // Health & Info sind offen (kein /api/ Prefix)
   return requireAuth(req, res, next);
 });
 
