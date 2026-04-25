@@ -9,599 +9,477 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// helper to build sort query
-const buildSort = (sortParam) => {
-  if (!sortParam) return '';
-  const dir = sortParam.startsWith('-') ? 'DESC' : 'ASC';
+// ==========================
+// HELPERS
+// ==========================
+
+const applySort = (query, sortParam) => {
+  if (!sortParam) return query;
+  const dir = sortParam.startsWith('-') ? 'desc' : 'asc';
   const field = sortParam.replace(/^-/, '');
   const allowed = ['created_date', 'activity_date', 'project_name', 'employee_name', 'actual_hours', 'project_number', 'name', 'role'];
-  return allowed.includes(field) ? `ORDER BY ${field} ${dir}` : '';
+  if (!allowed.includes(field)) return query;
+  return query.orderBy(field, dir);
 };
 
-// helper to validate required fields
 const validateRequired = (body, fields) => {
   const missing = fields.filter(f => !body[f] && body[f] !== 0);
-  if (missing.length > 0) {
-    return `Pflichtfelder fehlen: ${missing.join(', ')}`;
-  }
-  return null;
+  return missing.length > 0 ? `Pflichtfelder fehlen: ${missing.join(', ')}` : null;
 };
 
 // ==========================
 // AUTH
 // ==========================
 
-// POST /api/auth/login — E-Mail + Passwort prüfen
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: 'E-Mail und Passwort sind erforderlich.' });
-  }
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'E-Mail und Passwort sind erforderlich.' });
 
-  const employee = db.prepare('SELECT * FROM employees WHERE LOWER(email) = LOWER(?)').get(email.trim());
+    const snapshot = await db.collection('employees')
+      .where('email_lower', '==', email.trim().toLowerCase())
+      .limit(1).get();
 
-  if (!employee) {
-    return res.status(401).json({ error: 'E-Mail oder Passwort falsch.' });
-  }
+    if (snapshot.empty) return res.status(401).json({ error: 'E-Mail oder Passwort falsch.' });
 
-  if (!employee.password_hash) {
-    // Account exists but no password set yet
-    return res.status(403).json({ error: 'password_not_set', message: 'Für dieses Konto wurde noch kein Passwort vergeben. Bitte Erstanmeldung durchführen.' });
-  }
+    const employee = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
 
-  const isValid = bcrypt.compareSync(password, employee.password_hash);
-  if (!isValid) {
-    return res.status(401).json({ error: 'E-Mail oder Passwort falsch.' });
-  }
+    if (!employee.password_hash) {
+      return res.status(403).json({ error: 'password_not_set', message: 'Für dieses Konto wurde noch kein Passwort vergeben.' });
+    }
 
-  // Login successful
-  res.json({
-    id: employee.id,
-    name: employee.name,
-    email: employee.email,
-    role: employee.role,
-    hourly_rate: employee.hourly_rate,
-  });
+    if (!bcrypt.compareSync(password, employee.password_hash)) {
+      return res.status(401).json({ error: 'E-Mail oder Passwort falsch.' });
+    }
+
+    res.json({ id: employee.id, name: employee.name, email: employee.email, role: employee.role, hourly_rate: employee.hourly_rate });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/auth/set-password — Erstanmeldung: Passwort setzen (mit Invite-Code)
-app.post('/api/auth/set-password', (req, res) => {
-  const { email, password, invite_code } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: 'E-Mail und Passwort sind erforderlich.' });
-  }
+app.post('/api/auth/set-password', async (req, res) => {
+  try {
+    const { email, password, invite_code } = req.body;
+    const VALID_INVITE_CODE = process.env.invite_code || '85fce0c7af4544e48b97630d337f0141';
+    if (invite_code?.trim() !== VALID_INVITE_CODE) return res.status(403).json({ error: 'Ungültiger Invite-Code.' });
+    if (!password || password.length < 6) return res.status(400).json({ error: 'Passwort muss mindestens 6 Zeichen lang sein.' });
 
-  if (!invite_code) {
-    return res.status(400).json({ error: 'Invite-Code ist erforderlich.' });
-  }
+    const snapshot = await db.collection('employees')
+      .where('email_lower', '==', email.trim().toLowerCase())
+      .limit(1).get();
 
-  // Validate invite code
-  const VALID_INVITE_CODE = process.env.invite_code || '85fce0c7af4544e48b97630d337f0141';
-  if (invite_code.trim() !== VALID_INVITE_CODE) {
-    return res.status(403).json({ error: 'Ungültiger Invite-Code.' });
-  }
+    if (snapshot.empty) return res.status(404).json({ error: 'Kein Konto mit dieser E-Mail gefunden.' });
 
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'Passwort muss mindestens 6 Zeichen lang sein.' });
-  }
+    const doc = snapshot.docs[0];
+    if (doc.data().password_hash) return res.status(400).json({ error: 'Für dieses Konto wurde bereits ein Passwort vergeben.' });
 
-  const employee = db.prepare('SELECT * FROM employees WHERE LOWER(email) = LOWER(?)').get(email.trim());
+    const password_hash = bcrypt.hashSync(password, 10);
+    await doc.ref.update({ password_hash });
 
-  if (!employee) {
-    return res.status(404).json({ error: 'Kein Konto mit dieser E-Mail gefunden.' });
-  }
-
-  if (employee.password_hash) {
-    return res.status(400).json({ error: 'Für dieses Konto wurde bereits ein Passwort vergeben.' });
-  }
-
-  const password_hash = bcrypt.hashSync(password, 10);
-  db.prepare('UPDATE employees SET password_hash = ? WHERE id = ?').run(password_hash, employee.id);
-
-  res.json({
-    id: employee.id,
-    name: employee.name,
-    email: employee.email,
-    role: employee.role,
-    hourly_rate: employee.hourly_rate,
-  });
+    const emp = doc.data();
+    res.json({ id: doc.id, name: emp.name, email: emp.email, role: emp.role, hourly_rate: emp.hourly_rate });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/auth/check-email — Prüfen ob E-Mail existiert und ob Passwort gesetzt ist
-app.post('/api/auth/check-email', (req, res) => {
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: 'E-Mail ist erforderlich.' });
-  }
+app.post('/api/auth/check-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'E-Mail ist erforderlich.' });
 
-  const employee = db.prepare('SELECT id, name, email, password_hash FROM employees WHERE LOWER(email) = LOWER(?)').get(email.trim());
+    const snapshot = await db.collection('employees')
+      .where('email_lower', '==', email.trim().toLowerCase())
+      .limit(1).get();
 
-  if (!employee) {
-    return res.status(404).json({ exists: false });
-  }
+    if (snapshot.empty) return res.status(404).json({ exists: false });
 
-  res.json({
-    exists: true,
-    hasPassword: !!employee.password_hash,
-    name: employee.name,
-  });
+    const emp = snapshot.docs[0].data();
+    res.json({ exists: true, hasPassword: !!emp.password_hash, name: emp.name });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==========================
+// ADMIN SEED
+// ==========================
+
+// POST /api/admin/seed-user — GF-Account anlegen (geschützt mit invite_code)
+app.post('/api/admin/seed-user', async (req, res) => {
+  try {
+    const { name, email, role, invite_code } = req.body;
+    const VALID_INVITE_CODE = process.env.invite_code || '85fce0c7af4544e48b97630d337f0141';
+    if (invite_code?.trim() !== VALID_INVITE_CODE) return res.status(403).json({ error: 'Ungültiger Invite-Code.' });
+    if (!name || !email) return res.status(400).json({ error: 'name und email sind erforderlich.' });
+
+    const emailLower = email.trim().toLowerCase();
+    const existing = await db.collection('employees').where('email_lower', '==', emailLower).limit(1).get();
+    if (!existing.empty) return res.status(409).json({ error: 'Ein Konto mit dieser E-Mail existiert bereits.' });
+
+    const created_date = new Date().toISOString();
+    const docRef = await db.collection('employees').add({
+      name: name.trim(),
+      email: email.trim(),
+      email_lower: emailLower,
+      role: role || 'GF',
+      hourly_rate: null,
+      created_date,
+    });
+
+    res.json({ id: docRef.id, name, email, role: role || 'GF', message: 'Account angelegt. Passwort kann über Erstanmeldung gesetzt werden.' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ==========================
 // EMPLOYEES
 // ==========================
-app.get('/api/employees', (req, res) => {
-  const sort = buildSort(req.query.sort);
-  const rows = db.prepare(`SELECT * FROM employees ${sort}`).all();
-  res.json(rows);
+
+app.get('/api/employees', async (req, res) => {
+  try {
+    let query = db.collection('employees');
+    query = applySort(query, req.query.sort);
+    const snapshot = await query.get();
+    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), password_hash: undefined })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/employees', (req, res) => {
-  const error = validateRequired(req.body, ['name']);
-  if (error) return res.status(400).json({ error });
+app.post('/api/employees', async (req, res) => {
+  try {
+    const data = req.body;
+    const error = validateRequired(data, ['name']);
+    if (error) return res.status(400).json({ error });
 
-  const id = uuidv4();
-  const data = req.body;
-  const created_date = new Date().toISOString();
-
-  const stmt = db.prepare(`
-    INSERT INTO employees (id, name, email, role, hourly_rate, created_date)
-    VALUES (@id, @name, @email, @role, @hourly_rate, @created_date)
-  `);
-  stmt.run({ email: null, role: 'MA', hourly_rate: null, ...data, id, created_date });
-  res.json({ id, ...data, created_date });
+    const created_date = new Date().toISOString();
+    const email_lower = data.email ? data.email.toLowerCase() : null;
+    const docRef = await db.collection('employees').add({ role: 'MA', ...data, email_lower, created_date });
+    res.json({ id: docRef.id, ...data, created_date });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/employees/:id', (req, res) => {
-  const data = req.body;
-  const id = req.params.id;
-  const stmt = db.prepare(`
-    UPDATE employees SET name=@name, email=@email, role=@role, hourly_rate=@hourly_rate WHERE id=@id
-  `);
-  stmt.run({ email: null, role: 'MA', hourly_rate: null, ...data, id });
-  res.json({ id, ...data });
+app.put('/api/employees/:id', async (req, res) => {
+  try {
+    const data = req.body;
+    const email_lower = data.email ? data.email.toLowerCase() : null;
+    await db.collection('employees').doc(req.params.id).update({ ...data, email_lower });
+    res.json({ id: req.params.id, ...data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/employees/:id', (req, res) => {
-  db.prepare('DELETE FROM employees WHERE id = ?').run(req.params.id);
-  res.json({ success: true });
+app.delete('/api/employees/:id', async (req, res) => {
+  try {
+    await db.collection('employees').doc(req.params.id).delete();
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ==========================
 // PROJECTS
 // ==========================
-app.get('/api/projects', (req, res) => {
-  const sort = buildSort(req.query.sort);
-  const rows = db.prepare(`SELECT * FROM projects ${sort}`).all();
-  res.json(rows);
+
+app.get('/api/projects', async (req, res) => {
+  try {
+    let query = db.collection('projects');
+    query = applySort(query, req.query.sort);
+    const snapshot = await query.get();
+    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/projects', (req, res) => {
-  const error = validateRequired(req.body, ['project_number', 'project_name']);
-  if (error) return res.status(400).json({ error });
-
-  const id = uuidv4();
-  const data = req.body;
-  const created_date = new Date().toISOString();
-  
-  const stmt = db.prepare(`
-    INSERT INTO projects (id, project_number, project_name, customer_name, project_leader, project_leader_email, planned_hours, start_date, end_date, order_number, external_project_number, customer_number, contract_number, hourly_rate, payment_terms, vat_rate, employee_name, created_date)
-    VALUES (@id, @project_number, @project_name, @customer_name, @project_leader, @project_leader_email, @planned_hours, @start_date, @end_date, @order_number, @external_project_number, @customer_number, @contract_number, @hourly_rate, @payment_terms, @vat_rate, @employee_name, @created_date)
-  `);
-  
-  stmt.run({ 
-    project_number: null, project_name: null, customer_name: null, project_leader: null, project_leader_email: null,
-    planned_hours: null, start_date: null, end_date: null,
-    order_number: null, external_project_number: null, customer_number: null, contract_number: null, 
-    hourly_rate: null, payment_terms: 30, vat_rate: 19, employee_name: null,
-    ...data, id, created_date 
-  });
-  res.json({ id, ...data, created_date });
+app.post('/api/projects', async (req, res) => {
+  try {
+    const data = req.body;
+    const error = validateRequired(data, ['project_number', 'project_name']);
+    if (error) return res.status(400).json({ error });
+    const created_date = new Date().toISOString();
+    const docRef = await db.collection('projects').add({ payment_terms: 30, vat_rate: 19, ...data, created_date });
+    res.json({ id: docRef.id, ...data, created_date });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/projects/:id', (req, res) => {
-  const data = req.body;
-  const id = req.params.id;
-  const stmt = db.prepare(`
-    UPDATE projects 
-    SET project_number=@project_number, project_name=@project_name, customer_name=@customer_name, 
-        project_leader=@project_leader, project_leader_email=@project_leader_email, planned_hours=@planned_hours, start_date=@start_date, end_date=@end_date,
-        order_number=@order_number, external_project_number=@external_project_number, customer_number=@customer_number, contract_number=@contract_number,
-        hourly_rate=@hourly_rate, payment_terms=@payment_terms, vat_rate=@vat_rate, employee_name=@employee_name
-    WHERE id=@id
-  `);
-  stmt.run({ 
-    project_number: null, project_name: null, customer_name: null, project_leader: null, project_leader_email: null,
-    planned_hours: null, start_date: null, end_date: null,
-    order_number: null, external_project_number: null, customer_number: null, contract_number: null,
-    hourly_rate: null, payment_terms: 30, vat_rate: 19, employee_name: null,
-    ...data, id 
-  });
-  res.json({ id, ...data });
+app.put('/api/projects/:id', async (req, res) => {
+  try {
+    await db.collection('projects').doc(req.params.id).update(req.body);
+    res.json({ id: req.params.id, ...req.body });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/projects/:id', (req, res) => {
-  const id = req.params.id;
-  const activityCount = db.prepare('SELECT COUNT(*) as count FROM activities WHERE project_id = ?').get(id).count;
-  
-  if (activityCount > 0) {
-    // Cascade: delete associated activities first
-    db.prepare('DELETE FROM activities WHERE project_id = ?').run(id);
-  }
-  
-  db.prepare('DELETE FROM projects WHERE id = ?').run(id);
-  res.json({ success: true, deletedActivities: activityCount });
+app.delete('/api/projects/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const activities = await db.collection('activities').where('project_id', '==', id).get();
+    const batch = db.batch();
+    activities.docs.forEach(doc => batch.delete(doc.ref));
+    batch.delete(db.collection('projects').doc(id));
+    await batch.commit();
+    res.json({ success: true, deletedActivities: activities.size });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ==========================
 // SUBPROJECTS
 // ==========================
-app.get('/api/subprojects', (req, res) => {
-  const { project_id } = req.query;
-  if (project_id) {
-    const rows = db.prepare('SELECT * FROM subprojects WHERE project_id = ? ORDER BY name').all(project_id);
-    res.json(rows);
-  } else {
-    const rows = db.prepare('SELECT * FROM subprojects ORDER BY name').all();
-    res.json(rows);
-  }
+
+app.get('/api/subprojects', async (req, res) => {
+  try {
+    const { project_id } = req.query;
+    let query = db.collection('subprojects');
+    if (project_id) query = query.where('project_id', '==', project_id);
+    const snapshot = await query.orderBy('name').get();
+    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/subprojects', (req, res) => {
-  const error = validateRequired(req.body, ['project_id', 'name']);
-  if (error) return res.status(400).json({ error });
-
-  const id = uuidv4();
-  const { project_id, name, number } = req.body;
-  const created_date = new Date().toISOString();
-
-  const stmt = db.prepare('INSERT INTO subprojects (id, project_id, name, number, created_date) VALUES (?, ?, ?, ?, ?)');
-  stmt.run(id, project_id, name, number || null, created_date);
-  res.json({ id, project_id, name, number: number || null, created_date });
+app.post('/api/subprojects', async (req, res) => {
+  try {
+    const data = req.body;
+    const error = validateRequired(data, ['project_id', 'name']);
+    if (error) return res.status(400).json({ error });
+    const created_date = new Date().toISOString();
+    const docRef = await db.collection('subprojects').add({ ...data, created_date });
+    res.json({ id: docRef.id, ...data, created_date });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/subprojects/:id', (req, res) => {
-  const { name, number } = req.body;
-  const id = req.params.id;
-  const stmt = db.prepare('UPDATE subprojects SET name = ?, number = ? WHERE id = ?');
-  stmt.run(name, number || null, id);
-  res.json({ id, name, number: number || null });
+app.put('/api/subprojects/:id', async (req, res) => {
+  try {
+    await db.collection('subprojects').doc(req.params.id).update(req.body);
+    res.json({ id: req.params.id, ...req.body });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/subprojects/:id', (req, res) => {
-  db.prepare('DELETE FROM subprojects WHERE id = ?').run(req.params.id);
-  res.json({ success: true });
+app.delete('/api/subprojects/:id', async (req, res) => {
+  try {
+    await db.collection('subprojects').doc(req.params.id).delete();
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ==========================
 // ACTIVITIES
 // ==========================
-app.get('/api/activities', (req, res) => {
-  const sort = buildSort(req.query.sort);
-  const rows = db.prepare(`SELECT * FROM activities ${sort}`).all();
-  res.json(rows);
+
+app.get('/api/activities', async (req, res) => {
+  try {
+    let query = db.collection('activities');
+    query = applySort(query, req.query.sort);
+    const snapshot = await query.get();
+    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/activities', (req, res) => {
-  const error = validateRequired(req.body, ['project_id', 'description', 'activity_date', 'actual_hours']);
-  if (error) return res.status(400).json({ error });
-
-  const id = uuidv4();
-  const data = req.body;
-  const created_date = new Date().toISOString();
-  
-  const stmt = db.prepare(`
-    INSERT INTO activities (id, project_id, description, employee_name, activity_date, actual_hours, notes, status, subproject_id, created_date)
-    VALUES (@id, @project_id, @description, @employee_name, @activity_date, @actual_hours, @notes, @status, @subproject_id, @created_date)
-  `);
-  
-  stmt.run({ employee_name: null, notes: null, status: 'offen', subproject_id: null, ...data, id, created_date });
-  res.json({ id, ...data, created_date });
+app.post('/api/activities', async (req, res) => {
+  try {
+    const data = req.body;
+    const error = validateRequired(data, ['project_id', 'description', 'activity_date', 'actual_hours']);
+    if (error) return res.status(400).json({ error });
+    const created_date = new Date().toISOString();
+    const docRef = await db.collection('activities').add({ status: 'offen', ...data, created_date });
+    res.json({ id: docRef.id, ...data, created_date });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/activities/:id', (req, res) => {
-  const data = req.body;
-  const id = req.params.id;
-  const stmt = db.prepare(`
-    UPDATE activities 
-    SET project_id=@project_id, description=@description, employee_name=@employee_name, 
-        activity_date=@activity_date, actual_hours=@actual_hours, notes=@notes, subproject_id=@subproject_id
-    WHERE id=@id
-  `);
-  stmt.run({ employee_name: null, notes: null, subproject_id: null, ...data, id });
-  res.json({ id, ...data });
+app.put('/api/activities/:id', async (req, res) => {
+  try {
+    await db.collection('activities').doc(req.params.id).update(req.body);
+    res.json({ id: req.params.id, ...req.body });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/activities/:id', (req, res) => {
-  db.prepare('DELETE FROM activities WHERE id = ?').run(req.params.id);
-  res.json({ success: true });
+app.delete('/api/activities/:id', async (req, res) => {
+  try {
+    await db.collection('activities').doc(req.params.id).delete();
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ==========================
-// ACTIVITY STATUS (Freigabe-Workflow)
+// ACTIVITY STATUS
 // ==========================
 
-// MA bestätigt eigene Tätigkeiten (Batch: alle für einen Monat/Projekt)
-app.post('/api/activities/confirm', (req, res) => {
-  const { activity_ids, confirmed_by } = req.body;
-  if (!activity_ids || !Array.isArray(activity_ids) || activity_ids.length === 0) {
-    return res.status(400).json({ error: 'activity_ids (Array) ist erforderlich' });
-  }
-  const confirmed_at = new Date().toISOString();
-  const stmt = db.prepare(`
-    UPDATE activities SET status='bestätigt', confirmed_at=@confirmed_at, confirmed_by=@confirmed_by WHERE id=@id AND status='offen'
-  `);
-  const tx = db.transaction(() => {
-    let count = 0;
-    for (const id of activity_ids) {
-      const result = stmt.run({ id, confirmed_at, confirmed_by: confirmed_by || null });
-      count += result.changes;
+app.post('/api/activities/confirm', async (req, res) => {
+  try {
+    const { activity_ids, confirmed_by } = req.body;
+    const confirmed_at = new Date().toISOString();
+    const batch = db.batch();
+    activity_ids.forEach(id => batch.update(db.collection('activities').doc(id), { status: 'bestätigt', confirmed_at, confirmed_by: confirmed_by || null }));
+    await batch.commit();
+    res.json({ success: true, confirmed: activity_ids.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/activities/approve', async (req, res) => {
+  try {
+    const { activity_ids, approved_by } = req.body;
+    const approved_at = new Date().toISOString();
+    const batch = db.batch();
+    activity_ids.forEach(id => batch.update(db.collection('activities').doc(id), { status: 'freigegeben', approved_at, approved_by: approved_by || null }));
+    await batch.commit();
+    res.json({ success: true, approved: activity_ids.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/activities/reset-status', async (req, res) => {
+  try {
+    const { activity_ids } = req.body;
+    const batch = db.batch();
+    activity_ids.forEach(id => batch.update(db.collection('activities').doc(id), { status: 'offen', confirmed_at: null, confirmed_by: null, approved_at: null, approved_by: null }));
+    await batch.commit();
+    res.json({ success: true, reset: activity_ids.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==========================
+// TIMESHEETS
+// ==========================
+
+app.get('/api/timesheets', async (req, res) => {
+  try {
+    const snapshot = await db.collection('timesheets').orderBy('month', 'desc').get();
+    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/timesheets/confirm', async (req, res) => {
+  try {
+    const { employee_name, project_id, month, confirmed_by } = req.body;
+    const snapshot = await db.collection('timesheets')
+      .where('employee_name', '==', employee_name)
+      .where('project_id', '==', project_id)
+      .where('month', '==', month)
+      .limit(1).get();
+
+    const now = new Date().toISOString();
+    if (!snapshot.empty) {
+      const doc = snapshot.docs[0];
+      if (doc.data().status !== 'offen') return res.status(400).json({ error: 'Status nicht offen.' });
+      await doc.ref.update({ status: 'MA bestätigt', confirmed_at: now, confirmed_by });
+      return res.json({ id: doc.id, ...doc.data(), status: 'MA bestätigt' });
+    } else {
+      const docRef = await db.collection('timesheets').add({ employee_name, project_id, month, status: 'MA bestätigt', confirmed_at: now, confirmed_by, created_date: now });
+      res.json({ id: docRef.id, employee_name, project_id, month, status: 'MA bestätigt' });
     }
-    return count;
-  });
-  const updated = tx();
-  res.json({ success: true, confirmed: updated });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GF gibt Tätigkeiten frei (Batch)
-app.post('/api/activities/approve', (req, res) => {
-  const { activity_ids, approved_by } = req.body;
-  if (!activity_ids || !Array.isArray(activity_ids) || activity_ids.length === 0) {
-    return res.status(400).json({ error: 'activity_ids (Array) ist erforderlich' });
-  }
-  const approved_at = new Date().toISOString();
-  const stmt = db.prepare(`
-    UPDATE activities SET status='freigegeben', approved_at=@approved_at, approved_by=@approved_by WHERE id=@id AND status='bestätigt'
-  `);
-  const tx = db.transaction(() => {
-    let count = 0;
-    for (const id of activity_ids) {
-      const result = stmt.run({ id, approved_at, approved_by: approved_by || null });
-      count += result.changes;
+app.post('/api/timesheets/approve', async (req, res) => {
+  try {
+    const { id, approved_by } = req.body;
+    const now = new Date().toISOString();
+    await db.collection('timesheets').doc(id).update({ status: 'GF freigegeben', approved_at: now, approved_by });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/timesheets/reset', async (req, res) => {
+  try {
+    await db.collection('timesheets').doc(req.body.id).update({ status: 'offen', confirmed_at: null, confirmed_by: null, approved_at: null, approved_by: null });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/timesheets/:id', async (req, res) => {
+  try {
+    await db.collection('timesheets').doc(req.params.id).delete();
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==========================
+// PROJECT BILLINGS
+// ==========================
+
+app.get('/api/project-billings', async (req, res) => {
+  try {
+    const snapshot = await db.collection('project_billings').get();
+    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/project-billings', async (req, res) => {
+  try {
+    const { project_id, month, invoiced, payment_date, paid } = req.body;
+    const snapshot = await db.collection('project_billings')
+      .where('project_id', '==', project_id)
+      .where('month', '==', month)
+      .limit(1).get();
+
+    if (!snapshot.empty) {
+      await snapshot.docs[0].ref.update({ invoiced, payment_date, paid });
+      res.json({ id: snapshot.docs[0].id, ...req.body });
+    } else {
+      const docRef = await db.collection('project_billings').add({ ...req.body, created_date: new Date().toISOString() });
+      res.json({ id: docRef.id, ...req.body });
     }
-    return count;
-  });
-  const updated = tx();
-  res.json({ success: true, approved: updated });
-});
-
-// Status zurücksetzen (nur GF)
-app.post('/api/activities/reset-status', (req, res) => {
-  const { activity_ids } = req.body;
-  if (!activity_ids || !Array.isArray(activity_ids) || activity_ids.length === 0) {
-    return res.status(400).json({ error: 'activity_ids (Array) ist erforderlich' });
-  }
-  const stmt = db.prepare(`
-    UPDATE activities SET status='offen', confirmed_at=NULL, confirmed_by=NULL, approved_at=NULL, approved_by=NULL WHERE id=@id
-  `);
-  const tx = db.transaction(() => {
-    let count = 0;
-    for (const id of activity_ids) {
-      const result = stmt.run({ id });
-      count += result.changes;
-    }
-    return count;
-  });
-  const updated = tx();
-  res.json({ success: true, reset: updated });
-});
-
-// ==========================
-// TIMESHEETS (Stundenzettel)
-// ==========================
-
-// Liste aller Timesheets
-app.get('/api/timesheets', (req, res) => {
-  const rows = db.prepare('SELECT * FROM timesheets ORDER BY month DESC, employee_name ASC').all();
-  res.json(rows);
-});
-
-// Timesheet erstellen oder holen (MA bestätigt)
-app.post('/api/timesheets/confirm', (req, res) => {
-  const { employee_name, project_id, month, confirmed_by } = req.body;
-  if (!employee_name || !project_id || !month) {
-    return res.status(400).json({ error: 'employee_name, project_id und month sind erforderlich' });
-  }
-
-  const existing = db.prepare('SELECT * FROM timesheets WHERE employee_name=? AND project_id=? AND month=?').get(employee_name, project_id, month);
-
-  if (existing && existing.status !== 'offen') {
-    return res.status(400).json({ error: `Stundenzettel ist bereits im Status: ${existing.status}` });
-  }
-
-  const now = new Date().toISOString();
-
-  if (existing) {
-    db.prepare('UPDATE timesheets SET status=?, confirmed_at=?, confirmed_by=? WHERE id=?')
-      .run('MA bestätigt', now, confirmed_by || employee_name, existing.id);
-    res.json({ ...existing, status: 'MA bestätigt', confirmed_at: now, confirmed_by: confirmed_by || employee_name });
-  } else {
-    const id = uuidv4();
-    db.prepare('INSERT INTO timesheets (id, employee_name, project_id, month, status, confirmed_at, confirmed_by, created_date) VALUES (?,?,?,?,?,?,?,?)')
-      .run(id, employee_name, project_id, month, 'MA bestätigt', now, confirmed_by || employee_name, now);
-    res.json({ id, employee_name, project_id, month, status: 'MA bestätigt', confirmed_at: now, confirmed_by: confirmed_by || employee_name, created_date: now });
-  }
-});
-
-// GF gibt Stundenzettel frei
-app.post('/api/timesheets/approve', (req, res) => {
-  const { id, approved_by } = req.body;
-  if (!id) return res.status(400).json({ error: 'id ist erforderlich' });
-
-  const ts = db.prepare('SELECT * FROM timesheets WHERE id=?').get(id);
-  if (!ts) return res.status(404).json({ error: 'Stundenzettel nicht gefunden' });
-  if (ts.status !== 'MA bestätigt') {
-    return res.status(400).json({ error: `Stundenzettel muss erst von MA bestätigt werden (aktuell: ${ts.status})` });
-  }
-
-  const now = new Date().toISOString();
-  db.prepare('UPDATE timesheets SET status=?, approved_at=?, approved_by=? WHERE id=?')
-    .run('GF freigegeben', now, approved_by || null, id);
-  res.json({ ...ts, status: 'GF freigegeben', approved_at: now, approved_by });
-});
-
-// Status zurücksetzen (nur GF)
-app.post('/api/timesheets/reset', (req, res) => {
-  const { id } = req.body;
-  if (!id) return res.status(400).json({ error: 'id ist erforderlich' });
-
-  db.prepare('UPDATE timesheets SET status=?, confirmed_at=NULL, confirmed_by=NULL, approved_at=NULL, approved_by=NULL WHERE id=?')
-    .run('offen', id);
-  res.json({ success: true });
-});
-
-// Timesheet löschen (nur GF)
-app.delete('/api/timesheets/:id', (req, res) => {
-  db.prepare('DELETE FROM timesheets WHERE id = ?').run(req.params.id);
-  res.json({ success: true });
-});
-
-// ==========================
-// PROJECT BILLINGS (Abrechnungsübersicht)
-// ==========================
-app.get('/api/project-billings', (req, res) => {
-  const rows = db.prepare('SELECT * FROM project_billings').all();
-  // Transform boolean fields
-  res.json(rows.map(r => ({
-    ...r,
-    invoiced: !!r.invoiced,
-    paid: !!r.paid
-  })));
-});
-
-app.post('/api/project-billings', (req, res) => {
-  const { project_id, month, invoiced, payment_date, paid } = req.body;
-  if (!project_id || !month) return res.status(400).json({ error: 'project_id and month are required' });
-
-  const existing = db.prepare('SELECT id FROM project_billings WHERE project_id = ? AND month = ?').get(project_id, month);
-  const now = new Date().toISOString();
-
-  if (existing) {
-    db.prepare(`
-      UPDATE project_billings SET invoiced = ?, payment_date = ?, paid = ? WHERE id = ?
-    `).run(invoiced ? 1 : 0, payment_date || null, paid ? 1 : 0, existing.id);
-    res.json({ id: existing.id, project_id, month, invoiced, payment_date, paid });
-  } else {
-    const id = uuidv4();
-    db.prepare(`
-      INSERT INTO project_billings (id, project_id, month, invoiced, payment_date, paid, created_date)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(id, project_id, month, invoiced ? 1 : 0, payment_date || null, paid ? 1 : 0, now);
-    res.json({ id, project_id, month, invoiced, payment_date, paid, created_date: now });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ==========================
 // EMAIL (Microsoft Graph API — OAuth Delegated Flow)
 // ==========================
 
-// Refresh Token aus Firestore holen
 async function getStoredTokens() {
   const doc = await db.collection('app_settings').doc('ms_oauth').get();
   if (!doc.exists) return null;
   return doc.data();
 }
 
-// Tokens in Firestore speichern
 async function storeTokens(tokens) {
-  await db.collection('app_settings').doc('ms_oauth').set({
-    ...tokens,
-    updated_at: new Date().toISOString(),
-  }, { merge: true });
+  await db.collection('app_settings').doc('ms_oauth').set({ ...tokens, updated_at: new Date().toISOString() }, { merge: true });
 }
 
-// Access Token via Refresh Token erneuern
 async function refreshAccessToken(refreshToken) {
-  const tenantId = process.env.M365_TENANT_ID;
-  const clientId = process.env.M365_CLIENT_ID;
-  const clientSecret = process.env.M365_CLIENT_SECRET;
-
   const params = new URLSearchParams({
     grant_type: 'refresh_token',
-    client_id: clientId,
-    client_secret: clientSecret,
+    client_id: process.env.M365_CLIENT_ID,
+    client_secret: process.env.M365_CLIENT_SECRET,
     refresh_token: refreshToken,
     scope: 'https://graph.microsoft.com/Mail.Send offline_access',
   });
 
-  const response = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+  const response = await fetch(`https://login.microsoftonline.com/${process.env.M365_TENANT_ID}/oauth2/v2.0/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params.toString(),
   });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Token-Refresh fehlgeschlagen: ${err}`);
-  }
-
+  if (!response.ok) throw new Error(`Token-Refresh fehlgeschlagen: ${await response.text()}`);
   return response.json();
 }
 
-// GET /api/email/auth-url — OAuth-Login-URL generieren
 app.get('/api/email/auth-url', (req, res) => {
-  const tenantId = process.env.M365_TENANT_ID;
-  const clientId = process.env.M365_CLIENT_ID;
   const redirectUri = process.env.M365_REDIRECT_URI || `${req.protocol}://${req.get('host')}/api/email/callback`;
-
-  if (!tenantId || !clientId) {
-    return res.status(500).json({ error: 'M365_TENANT_ID und M365_CLIENT_ID müssen gesetzt sein.' });
-  }
-
   const params = new URLSearchParams({
-    client_id: clientId,
+    client_id: process.env.M365_CLIENT_ID,
     response_type: 'code',
     redirect_uri: redirectUri,
     scope: 'https://graph.microsoft.com/Mail.Send offline_access',
     response_mode: 'query',
     prompt: 'select_account',
   });
-
-  const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?${params.toString()}`;
-  res.json({ url: authUrl });
+  res.json({ url: `https://login.microsoftonline.com/${process.env.M365_TENANT_ID}/oauth2/v2.0/authorize?${params.toString()}` });
 });
 
-// GET /api/email/callback — OAuth-Callback: Code gegen Tokens tauschen
 app.get('/api/email/callback', async (req, res) => {
   const { code, error } = req.query;
-
-  if (error) {
-    return res.redirect(`/?ms_auth=error&message=${encodeURIComponent(error)}`);
-  }
-
-  if (!code) {
-    return res.status(400).send('Kein Authorization Code erhalten.');
-  }
+  if (error) return res.redirect(`/?ms_auth=error&message=${encodeURIComponent(error)}`);
+  if (!code) return res.status(400).send('Kein Authorization Code erhalten.');
 
   try {
-    const tenantId = process.env.M365_TENANT_ID;
-    const clientId = process.env.M365_CLIENT_ID;
-    const clientSecret = process.env.M365_CLIENT_SECRET;
     const redirectUri = process.env.M365_REDIRECT_URI || `${req.protocol}://${req.get('host')}/api/email/callback`;
-
     const params = new URLSearchParams({
       grant_type: 'authorization_code',
-      client_id: clientId,
-      client_secret: clientSecret,
+      client_id: process.env.M365_CLIENT_ID,
+      client_secret: process.env.M365_CLIENT_SECRET,
       code,
       redirect_uri: redirectUri,
       scope: 'https://graph.microsoft.com/Mail.Send offline_access',
     });
 
-    const tokenResponse = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+    const tokenResponse = await fetch(`https://login.microsoftonline.com/${process.env.M365_TENANT_ID}/oauth2/v2.0/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
     });
 
-    if (!tokenResponse.ok) {
-      const err = await tokenResponse.text();
-      throw new Error(`Token-Austausch fehlgeschlagen: ${err}`);
-    }
-
+    if (!tokenResponse.ok) throw new Error(await tokenResponse.text());
     const tokens = await tokenResponse.json();
 
-    // Sender-Email aus dem ID-Token lesen
     let senderEmail = null;
     if (tokens.id_token) {
       try {
@@ -610,62 +488,35 @@ app.get('/api/email/callback', async (req, res) => {
       } catch {}
     }
 
-    // Tokens + Email in Firestore speichern
-    await storeTokens({
-      access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token,
-      expires_at: new Date(Date.now() + tokens.expires_in * 1000).toISOString(),
-      sender_email: senderEmail,
-    });
-
-    // Zurück zur App mit Erfolg
+    await storeTokens({ access_token: tokens.access_token, refresh_token: tokens.refresh_token, expires_at: new Date(Date.now() + tokens.expires_in * 1000).toISOString(), sender_email: senderEmail });
     res.redirect(`/?ms_auth=success&email=${encodeURIComponent(senderEmail || '')}`);
   } catch (err) {
-    console.error('OAuth Callback Fehler:', err.message);
     res.redirect(`/?ms_auth=error&message=${encodeURIComponent(err.message)}`);
   }
 });
 
-// GET /api/email/config — Verbindungsstatus prüfen
 app.get('/api/email/config', async (req, res) => {
   try {
     const tokens = await getStoredTokens();
-    res.json({
-      connected: !!(tokens?.refresh_token),
-      senderEmail: tokens?.sender_email || null,
-      expiresAt: tokens?.expires_at || null,
-    });
-  } catch (err) {
-    res.json({ connected: false, senderEmail: null });
-  }
+    res.json({ connected: !!(tokens?.refresh_token), senderEmail: tokens?.sender_email || null, expiresAt: tokens?.expires_at || null });
+  } catch { res.json({ connected: false, senderEmail: null }); }
 });
 
-// DELETE /api/email/disconnect — Microsoft-Verbindung trennen
 app.delete('/api/email/disconnect', async (req, res) => {
   try {
     await db.collection('app_settings').doc('ms_oauth').delete();
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/email/send-timesheet — Stundenzettel per Microsoft Graph API senden
 app.post('/api/email/send-timesheet', async (req, res) => {
   const { to, cc, subject, body, pdf_base64, pdf_filename } = req.body;
-
-  if (!to || !subject || !body) {
-    return res.status(400).json({ error: 'to, subject und body sind erforderlich.' });
-  }
+  if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject und body sind erforderlich.' });
 
   try {
-    // Gespeicherte Tokens laden
     let tokens = await getStoredTokens();
-    if (!tokens?.refresh_token) {
-      return res.status(401).json({ error: 'Microsoft-Konto nicht verbunden. Bitte zuerst mit Microsoft anmelden.' });
-    }
+    if (!tokens?.refresh_token) return res.status(401).json({ error: 'Microsoft-Konto nicht verbunden. Bitte zuerst in Einstellungen verbinden.' });
 
-    // Access Token erneuern falls abgelaufen
     const isExpired = !tokens.expires_at || new Date(tokens.expires_at) <= new Date(Date.now() + 60000);
     if (isExpired || !tokens.access_token) {
       const refreshed = await refreshAccessToken(tokens.refresh_token);
@@ -675,51 +526,43 @@ app.post('/api/email/send-timesheet', async (req, res) => {
       await storeTokens(tokens);
     }
 
-    const senderEmail = tokens.sender_email;
-    if (!senderEmail) {
-      return res.status(500).json({ error: 'Sender-Email nicht bekannt. Bitte erneut mit Microsoft verbinden.' });
-    }
-
     const toList = (Array.isArray(to) ? to : [to]).map(email => ({ emailAddress: { address: email } }));
     const ccList = cc ? (Array.isArray(cc) ? cc : [cc]).map(email => ({ emailAddress: { address: email } })) : [];
 
-    const message = {
-      subject,
-      body: { contentType: 'Text', content: body },
-      toRecipients: toList,
-      ccRecipients: ccList,
-    };
-
+    const message = { subject, body: { contentType: 'Text', content: body }, toRecipients: toList, ccRecipients: ccList };
     if (pdf_base64 && pdf_filename) {
-      message.attachments = [{
-        '@odata.type': '#microsoft.graph.fileAttachment',
-        name: pdf_filename,
-        contentType: 'application/pdf',
-        contentBytes: pdf_base64,
-      }];
+      message.attachments = [{ '@odata.type': '#microsoft.graph.fileAttachment', name: pdf_filename, contentType: 'application/pdf', contentBytes: pdf_base64 }];
     }
 
-    const graphResponse = await fetch(`https://graph.microsoft.com/v1.0/me/sendMail`, {
+    const graphResponse = await fetch('https://graph.microsoft.com/v1.0/me/sendMail', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${tokens.access_token}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ message, saveToSentItems: true }),
     });
 
-    if (!graphResponse.ok) {
-      const errText = await graphResponse.text();
-      return res.status(502).json({ error: `Graph API Fehler: ${graphResponse.status} ${errText}` });
-    }
-
-    res.json({ success: true, sentFrom: senderEmail });
-  } catch (err) {
-    res.status(500).json({ error: `Fehler beim Senden: ${err.message}` });
-  }
+    if (!graphResponse.ok) return res.status(502).json({ error: `Graph API Fehler: ${graphResponse.status} ${await graphResponse.text()}` });
+    res.json({ success: true, sentFrom: tokens.sender_email });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-const PORT = 3001;
-app.listen(PORT, () => {
-  console.log(`Local Backend Server running on http://localhost:${PORT}`);
+// ==========================
+// START
+// ==========================
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, async () => {
+  console.log(`Backend Server running on port ${PORT}`);
+
+  // Seed: Thomas (GF) anlegen falls er fehlt
+  try {
+    const thomasEmail = 'thomas.kedzierski@projektwaerts.de';
+    const snapshot = await db.collection('employees').where('email_lower', '==', thomasEmail).limit(1).get();
+    if (snapshot.empty) {
+      const password_hash = bcrypt.hashSync('zeit-beta-2026', 10);
+      await db.collection('employees').add({ name: 'Thomas Kedzierski', email: thomasEmail, email_lower: thomasEmail, role: 'GF', hourly_rate: null, password_hash, created_date: new Date().toISOString() });
+      console.log('✅ Seed: Thomas Kedzierski angelegt.');
+    } else {
+      console.log('ℹ️ Seed: Thomas Kedzierski bereits vorhanden.');
+    }
+  } catch (err) { console.error('❌ Seed Fehler:', err.message); }
 });
