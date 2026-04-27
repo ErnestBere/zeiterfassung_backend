@@ -315,6 +315,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
 // ==========================
 // Alle /api/ Routen schützen, AUSSER Auth-Endpoints und Email-Callback
 app.use('/api', (req, res, next) => {
+  // OPTIONS Preflight-Requests immer durchlassen (CORS)
+  if (req.method === 'OPTIONS') return next();
+  
   const openPaths = [
     '/auth/login',
     '/auth/set-password',
