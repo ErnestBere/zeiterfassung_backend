@@ -10,7 +10,7 @@ app.use(cors({
   origin: process.env.FRONTEND_URL || 'https://zeiterfassung-frontend.pages.dev',
   credentials: true
 }));
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 
 // ==========================
 // CONSTANTS
@@ -21,8 +21,12 @@ if (!VALID_INVITE_CODE) {
   console.warn('⚠️ WARNUNG: Kein INVITE_CODE gesetzt! Erstanmeldung und Seed-User sind deaktiviert.');
 }
 
-const JWT_SECRET = process.env.JWT_SECRET || 'zeiterfassung-jwt-secret-change-me';
-const JWT_EXPIRES_IN = '7d'; // Token läuft nach 7 Tagen ab
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('🚨 FATAL: JWT_SECRET nicht gesetzt! Server kann nicht starten.');
+  process.exit(1);
+}
+const JWT_EXPIRES_IN = '7d';
 
 // ==========================
 // AUTH MIDDLEWARE
@@ -247,7 +251,13 @@ app.get('/api/employees', async (req, res) => {
     let query = db.collection('employees');
     query = applySort(query, req.query.sort);
     const snapshot = await query.get();
-    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), password_hash: undefined })));
+    const isGF = req.user?.role === 'GF';
+    res.json(snapshot.docs.map(doc => {
+      const data = { id: doc.id, ...doc.data(), password_hash: undefined };
+      // MA dürfen keine Stundensätze sehen
+      if (!isGF) data.hourly_rate = undefined;
+      return data;
+    }));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -289,7 +299,17 @@ app.get('/api/projects', async (req, res) => {
     let query = db.collection('projects');
     query = applySort(query, req.query.sort);
     const snapshot = await query.get();
-    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    const isGF = req.user?.role === 'GF';
+    res.json(snapshot.docs.map(doc => {
+      const data = { id: doc.id, ...doc.data() };
+      // MA dürfen keine Finanzdaten sehen
+      if (!isGF) {
+        data.hourly_rate = undefined;
+        data.payment_terms = undefined;
+        data.vat_rate = undefined;
+      }
+      return data;
+    }));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
