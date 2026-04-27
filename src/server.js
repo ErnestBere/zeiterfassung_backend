@@ -4,6 +4,7 @@ import cors from 'cors';
 import db from './database.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import nodemailer from 'nodemailer';
 
 const app = express();
 app.use(cors({
@@ -27,6 +28,18 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 const JWT_EXPIRES_IN = '7d';
+
+// SMTP für Passwort-Reset (Brevo)
+import crypto from 'crypto';
+const smtpTransporter = process.env.SMTP_HOST ? nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: parseInt(process.env.SMTP_PORT || '587'),
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USERNAME,
+    pass: process.env.SMTP_PASSWORD,
+  },
+}) : null;
 
 // ==========================
 // AUTH MIDDLEWARE
@@ -196,6 +209,107 @@ app.post('/api/auth/check-email', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// POST /api/auth/forgot-password — Reset-Link per E-Mail senden
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'E-Mail ist erforderlich.' });
+
+    // Immer gleiche Antwort (verhindert E-Mail-Enumeration)
+    const successResponse = { success: true, message: 'Falls ein Konto mit dieser E-Mail existiert, wurde ein Reset-Link gesendet.' };
+
+    if (!smtpTransporter) {
+      console.warn('⚠️ SMTP nicht konfiguriert — Passwort-Reset nicht möglich.');
+      return res.json(successResponse);
+    }
+
+    const snapshot = await db.collection('employees')
+      .where('email_lower', '==', email.trim().toLowerCase())
+      .limit(1).get();
+
+    if (snapshot.empty) return res.json(successResponse); // Kein Hinweis ob E-Mail existiert
+
+    const doc = snapshot.docs[0];
+    const employee = doc.data();
+
+    // Reset-Token generieren (64 Zeichen hex, 1h gültig)
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetExpires = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 Stunde
+
+    // Token in Firestore speichern
+    await doc.ref.update({ reset_token: resetToken, reset_expires: resetExpires });
+
+    // Reset-Link erstellen
+    const frontendUrl = process.env.FRONTEND_URL || 'https://zeiterfassung-frontend.pages.dev';
+    const resetLink = `${frontendUrl}/reset-password?token=${resetToken}&email=${encodeURIComponent(email.trim().toLowerCase())}`;
+
+    // E-Mail senden via Brevo SMTP
+    await smtpTransporter.sendMail({
+      from: `"${process.env.SMTP_FROM_NAME || 'Plinius Systems'}" <${process.env.SMTP_FROM || 'noreply@plinius-systems.de'}>`,
+      to: employee.email,
+      subject: 'Passwort zurücksetzen — Zeiterfassung',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #333;">Passwort zurücksetzen</h2>
+          <p>Hallo ${employee.name},</p>
+          <p>Du hast eine Passwort-Zurücksetzung für die Zeiterfassung angefordert.</p>
+          <p>Klicke auf den folgenden Link, um ein neues Passwort zu setzen:</p>
+          <p style="margin: 24px 0;">
+            <a href="${resetLink}" style="background-color: #7DD3C0; color: #000; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;">
+              Neues Passwort setzen
+            </a>
+          </p>
+          <p style="color: #666; font-size: 14px;">Dieser Link ist <strong>1 Stunde</strong> gültig.</p>
+          <p style="color: #666; font-size: 14px;">Falls du diese Anfrage nicht gestellt hast, ignoriere diese E-Mail.</p>
+          <hr style="border: none; border-top: 1px solid #eee; margin: 24px 0;" />
+          <p style="color: #999; font-size: 12px;">PROJEKTWÄRTS Zeiterfassung — Plinius Systems</p>
+        </div>
+      `,
+    });
+
+    console.log(`✅ Reset-Mail gesendet an ${email.trim().toLowerCase()}`);
+    res.json(successResponse);
+  } catch (err) {
+    console.error('❌ Forgot-Password Fehler:', err.message);
+    res.status(500).json({ error: 'E-Mail konnte nicht gesendet werden.' });
+  }
+});
+
+// POST /api/auth/reset-password — Neues Passwort setzen mit Token
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email, token, password } = req.body;
+    if (!email || !token || !password) return res.status(400).json({ error: 'E-Mail, Token und Passwort sind erforderlich.' });
+    if (password.length < 6) return res.status(400).json({ error: 'Passwort muss mindestens 6 Zeichen lang sein.' });
+
+    const snapshot = await db.collection('employees')
+      .where('email_lower', '==', email.trim().toLowerCase())
+      .limit(1).get();
+
+    if (snapshot.empty) return res.status(400).json({ error: 'Ungültiger oder abgelaufener Link.' });
+
+    const doc = snapshot.docs[0];
+    const employee = doc.data();
+
+    // Token prüfen
+    if (!employee.reset_token || employee.reset_token !== token) {
+      return res.status(400).json({ error: 'Ungültiger oder abgelaufener Link.' });
+    }
+
+    // Ablauf prüfen
+    if (!employee.reset_expires || new Date(employee.reset_expires) < new Date()) {
+      await doc.ref.update({ reset_token: null, reset_expires: null });
+      return res.status(400).json({ error: 'Der Link ist abgelaufen. Bitte fordere einen neuen an.' });
+    }
+
+    // Neues Passwort setzen + Token löschen
+    const password_hash = bcrypt.hashSync(password, 10);
+    await doc.ref.update({ password_hash, reset_token: null, reset_expires: null });
+
+    res.json({ success: true, message: 'Passwort wurde erfolgreich geändert.' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ==========================
 // ROUTE PROTECTION
 // ==========================
@@ -205,6 +319,8 @@ app.use('/api', (req, res, next) => {
     '/auth/login',
     '/auth/set-password',
     '/auth/check-email',
+    '/auth/forgot-password',
+    '/auth/reset-password',
     '/email/callback',
     '/admin/seed-user',
     '/cron/backup-onedrive',
