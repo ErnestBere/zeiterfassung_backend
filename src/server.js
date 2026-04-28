@@ -844,7 +844,7 @@ async function refreshAccessToken(refreshToken) {
     scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite offline_access',
   });
 
-  const response = await fetch(`https://login.microsoftonline.com/${process.env.M365_TENANT_ID}/oauth2/v2.0/token`, {
+  const response = await fetch(`https://login.microsoftonline.com/common/oauth2/v2.0/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params.toString(),
@@ -864,7 +864,7 @@ app.get('/api/email/auth-url', (req, res) => {
     response_mode: 'query',
     prompt: 'select_account',
   });
-  res.json({ url: `https://login.microsoftonline.com/${process.env.M365_TENANT_ID}/oauth2/v2.0/authorize?${params.toString()}` });
+  res.json({ url: `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${params.toString()}` });
 });
 
 app.get('/api/email/callback', async (req, res) => {
@@ -883,7 +883,7 @@ app.get('/api/email/callback', async (req, res) => {
       scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite offline_access',
     });
 
-    const tokenResponse = await fetch(`https://login.microsoftonline.com/${process.env.M365_TENANT_ID}/oauth2/v2.0/token`, {
+    const tokenResponse = await fetch(`https://login.microsoftonline.com/common/oauth2/v2.0/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
