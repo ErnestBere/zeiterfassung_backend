@@ -841,7 +841,7 @@ async function refreshAccessToken(refreshToken) {
     client_id: process.env.M365_CLIENT_ID,
     client_secret: process.env.M365_CLIENT_SECRET,
     refresh_token: refreshToken,
-    scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite offline_access',
+    scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite.AppFolder offline_access',
   });
 
   const response = await fetch(`https://login.microsoftonline.com/common/oauth2/v2.0/token`, {
@@ -860,7 +860,7 @@ app.get('/api/email/auth-url', (req, res) => {
     client_id: process.env.M365_CLIENT_ID,
     response_type: 'code',
     redirect_uri: redirectUri,
-    scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite offline_access',
+    scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite.AppFolder offline_access',
     response_mode: 'query',
     prompt: 'select_account',
   });
@@ -880,7 +880,7 @@ app.get('/api/email/callback', async (req, res) => {
       client_secret: process.env.M365_CLIENT_SECRET,
       code,
       redirect_uri: redirectUri,
-      scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite offline_access',
+      scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Files.ReadWrite.AppFolder offline_access',
     });
 
     const tokenResponse = await fetch(`https://login.microsoftonline.com/common/oauth2/v2.0/token`, {
@@ -1188,7 +1188,7 @@ app.post('/api/admin/backup/onedrive', async (req, res) => {
     const folderPath = configDoc.exists ? configDoc.data().folder_path : '/Zeiterfassung/Backups';
     const cleanPath = folderPath.replace(/^\/+|\/+$/g, '');
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
-    const backupFolder = `${cleanPath}/${timestamp}`;
+    const backupFolder = timestamp;
 
     // 3. Backup-Daten erstellen
     const collections = ['employees', 'projects', 'subprojects', 'activities', 'timesheets', 'project_billings', 'app_settings'];
@@ -1203,7 +1203,7 @@ app.post('/api/admin/backup/onedrive', async (req, res) => {
 
     // Helper: Upload nach OneDrive
     const uploadToOneDrive = async (fileName, content, contentType) => {
-      const uploadPath = `/me/drive/root:/${backupFolder}/${fileName}:/content`;
+      const uploadPath = `/me/drive/special/approot:/${backupFolder}/${fileName}:/content`;
       const response = await fetch(`https://graph.microsoft.com/v1.0${uploadPath}`, {
         method: 'PUT',
         headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Content-Type': contentType },
@@ -1316,7 +1316,7 @@ app.post('/api/cron/backup-onedrive', async (req, res) => {
     const folderPath = configDoc.exists ? configDoc.data().folder_path : '/Zeiterfassung/Backups';
     const cleanPath = folderPath.replace(/^\/+|\/+$/g, '');
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
-    const backupFolder = `${cleanPath}/${timestamp}`;
+    const backupFolder = timestamp;
 
     // Backup-Daten erstellen
     const collections = ['employees', 'projects', 'subprojects', 'activities', 'timesheets', 'project_billings', 'app_settings'];
@@ -1331,7 +1331,7 @@ app.post('/api/cron/backup-onedrive', async (req, res) => {
 
     // Helper: Upload
     const uploadToOneDrive = async (fileName, content, contentType) => {
-      const uploadPath = `/me/drive/root:/${backupFolder}/${fileName}:/content`;
+      const uploadPath = `/me/drive/special/approot:/${backupFolder}/${fileName}:/content`;
       const response = await fetch(`https://graph.microsoft.com/v1.0${uploadPath}`, {
         method: 'PUT',
         headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Content-Type': contentType },
