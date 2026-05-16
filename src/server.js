@@ -386,8 +386,10 @@ app.post('/api/employees', async (req, res) => {
     const error = validateRequired(data, ['name']);
     if (error) return res.status(400).json({ error });
 
+    // Namen trimmen um Trailing Spaces zu vermeiden
+    if (data.name) data.name = data.name.trim();
     const created_date = new Date().toISOString();
-    const email_lower = data.email ? data.email.toLowerCase() : null;
+    const email_lower = data.email ? data.email.trim().toLowerCase() : null;
     const docRef = await db.collection('employees').add({ role: 'MA', ...data, email_lower, created_date });
     res.json({ id: docRef.id, ...data, created_date });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -396,7 +398,9 @@ app.post('/api/employees', async (req, res) => {
 app.put('/api/employees/:id', async (req, res) => {
   try {
     const data = req.body;
-    const email_lower = data.email ? data.email.toLowerCase() : null;
+    // Namen trimmen um Trailing Spaces zu vermeiden
+    if (data.name) data.name = data.name.trim();
+    const email_lower = data.email ? data.email.trim().toLowerCase() : null;
     await db.collection('employees').doc(req.params.id).update({ ...data, email_lower });
     res.json({ id: req.params.id, ...data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -556,10 +560,11 @@ app.post('/api/activities', async (req, res) => {
     
     if (employeeNames.length === 1) {
       // Einzelner Mitarbeiter oder kein Mitarbeiter
+      const trimmedName = employeeNames[0] ? employeeNames[0].trim() : null;
       const docRef = await db.collection('activities').add({ 
         status: 'offen', 
         ...data, 
-        employee_name: employeeNames[0],
+        employee_name: trimmedName,
         created_date 
       });
       return res.json({ id: docRef.id, ...data, employee_name: employeeNames[0], created_date });
@@ -596,8 +601,11 @@ app.post('/api/activities', async (req, res) => {
 
 app.put('/api/activities/:id', async (req, res) => {
   try {
-    await db.collection('activities').doc(req.params.id).update(req.body);
-    res.json({ id: req.params.id, ...req.body });
+    const data = req.body;
+    // employee_name trimmen um Inkonsistenzen zu vermeiden
+    if (data.employee_name) data.employee_name = data.employee_name.trim();
+    await db.collection('activities').doc(req.params.id).update(data);
+    res.json({ id: req.params.id, ...data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
